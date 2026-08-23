@@ -21,7 +21,7 @@ STATE_FILE = "state.json"
 
 MIN_BODY_POINTS = 50
 MAX_WICK_PCT = 0.25
-MAX_PROCESSED_PER_TF = 300  # cap state file growth
+MAX_PROCESSED_PER_TF = 2000  # generous cap — state now only stores real candidates, not every candle
 
 # Timeframe -> API params + own duration in minutes
 TIMEFRAMES = {
@@ -161,14 +161,15 @@ def evaluate_candidates(tf_name, df_big, df_low, tf_minutes, confirm_minutes,
         body = row["c"] - row["o"]
         rng = row["h"] - row["l"]
         if rng <= 0 or abs(body) < MIN_BODY_POINTS:
-            newly_processed.append(ts_str)
+            # Doesn't qualify as a big candle — no need to remember this one,
+            # it's cheap to re-check next run and never needs revisiting.
             continue
 
         upper_wick = row["h"] - max(row["o"], row["c"])
         lower_wick = min(row["o"], row["c"]) - row["l"]
         total_wick = upper_wick + lower_wick
         if total_wick > MAX_WICK_PCT * rng:
-            newly_processed.append(ts_str)
+            # Same reasoning — not clean, cheap to re-check, don't persist.
             continue
 
         color = "green" if body > 0 else "red"
