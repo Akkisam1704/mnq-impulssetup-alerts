@@ -46,13 +46,21 @@ LOWER_GRAN_LOOKBACK_DAYS = {1: 5, 5: 15}
 def load_state():
     if os.path.exists(STATE_FILE):
         with open(STATE_FILE, "r") as f:
-            return json.load(f)
-    return {"processed": {tf: [] for tf in TIMEFRAMES}}
+            state = json.load(f)
+            state.setdefault("processed", {tf: [] for tf in TIMEFRAMES})
+            state.setdefault("raw_processed", {tf: [] for tf in TIMEFRAMES})
+            return state
+    return {
+        "processed": {tf: [] for tf in TIMEFRAMES},
+        "raw_processed": {tf: [] for tf in TIMEFRAMES},
+    }
 
 
 def save_state(state):
     for tf in state["processed"]:
         state["processed"][tf] = state["processed"][tf][-MAX_PROCESSED_PER_TF:]
+    for tf in state["raw_processed"]:
+        state["raw_processed"][tf] = state["raw_processed"][tf][-MAX_PROCESSED_PER_TF:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -209,6 +217,47 @@ def evaluate_candidates(tf_name, df_big, df_low, tf_minutes, confirm_minutes,
     return alerts, newly_processed
 
 
+def evaluate_raw_impulses(tf_name, df_big, raw_processed_list):
+    """
+    Instant, unconfirmed alert path: fires the moment a qualifying impulse
+    candle is seen as closed — no waiting for the lower-TF confirmation
+    window. Separate state list from the confirmed-setup path, so the two
+    alert types are tracked independently and don't interfere with each other.
+    """
+    raw_alerts = []
+    newly_processed = []
+
+    for i in range(len(df_big)):
+        row = df_big.iloc[i]
+        ts_str = row["t"].isoformat()
+        if ts_str in raw_processed_list:
+            continue
+
+        body = row["c"] - row["o"]
+        rng = row["h"] - row["l"]
+        if rng <= 0 or abs(body) < MIN_BODY_POINTS:
+            continue
+
+        upper_wick = row["h"] - max(row["o"], row["c"])
+        lower_wick = min(row["o"], row["c"]) - row["l"]
+        total_wick = upper_wick + lower_wick
+        if total_wick > MAX_WICK_PCT * rng:
+            continue
+
+        color = "green" if body > 0 else "red"
+        newly_processed.append(ts_str)
+        raw_alerts.append({
+            "tf": tf_name,
+            "time": ts_str,
+            "color": color,
+            "body_points": round(abs(body), 2),
+            "open": row["o"],
+            "close": row["c"],
+        })
+
+    return raw_alerts, newly_processed
+
+
 def main():
     state = load_state()
     session, headers = authenticate()
@@ -226,6 +275,7 @@ def main():
         return granularity_cache[key]
 
     all_alerts = []
+    all_raw_alerts = []
 
     for tf_name, cfg in TIMEFRAMES.items():
         df_big = get_granularity(cfg["minutes"], cfg["unit"], cfg["unitNumber"], cfg["lookback_days"])
@@ -241,6 +291,26 @@ def main():
         processed_list.extend(newly_processed)
         all_alerts.extend(alerts)
 
+        raw_processed_list = state["raw_processed"].setdefault(tf_name, [])
+        raw_alerts, raw_newly_processed = evaluate_raw_impulses(tf_name, df_big, raw_processed_list)
+        raw_processed_list.extend(raw_newly_processed)
+        all_raw_alerts.extend(raw_alerts)
+
+    # Instant, unconfirmed alerts — fire first since they're the faster signal
+    for alert in all_raw_alerts:
+        direction = "possible SHORT setup forming" if alert["color"] == "green" else "possible LONG setup forming"
+        msg = (
+            f"⚡ RAW IMPULSE — {alert['tf']} timeframe (NOT confirmed yet)\n"
+            f"Impulse candle: {alert['color'].upper()} ({alert['body_points']} pts)\n"
+            f"Time: {alert['time']}\n"
+            f"{direction}\n"
+            f"Watch for target (candle open): {alert['open']}\n"
+            f"Impulse close: {alert['close']}\n"
+            f"(A confirmed 🚨 alert will follow separately if the lower-timeframe reversal confirms.)"
+        )
+        print(msg)
+        send_telegram(msg)
+
     for alert in all_alerts:
         direction = "SHORT (fade back down)" if alert["color"] == "green" else "LONG (fade back up)"
         msg = (
@@ -254,7 +324,7 @@ def main():
         print(msg)
         send_telegram(msg)
 
-    if not all_alerts:
+    if not all_alerts and not all_raw_alerts:
         print("No new setups this run.")
 
     save_state(state)
