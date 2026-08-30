@@ -15,6 +15,26 @@ import json
 import requests
 import pandas as pd
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
+
+IST = ZoneInfo("Asia/Kolkata")
+
+
+def to_ist_str(iso_time_str):
+    """Convert a UTC ISO timestamp to a readable IST string,
+    e.g. '23 Aug 2026, 07:45 PM IST'."""
+    dt_utc = datetime.fromisoformat(iso_time_str)
+    dt_ist = dt_utc.astimezone(IST)
+    return dt_ist.strftime("%d %b %Y, %I:%M %p IST")
+
+
+def candle_close_ist_str(iso_start_time_str, tf_minutes):
+    """Bars are timestamped by their START time. This computes the actual
+    CLOSE time (start + duration) and formats it in IST — since alerts should
+    reflect when the candle actually finished forming, not when it started."""
+    dt_start_utc = datetime.fromisoformat(iso_start_time_str)
+    dt_close_utc = dt_start_utc + timedelta(minutes=tf_minutes)
+    return to_ist_str(dt_close_utc.isoformat())
 
 BASE_URL = "https://api.topstepx.com"
 STATE_FILE = "state.json"
@@ -49,10 +69,12 @@ def load_state():
             state = json.load(f)
             state.setdefault("processed", {tf: [] for tf in TIMEFRAMES})
             state.setdefault("raw_processed", {tf: [] for tf in TIMEFRAMES})
+            state.setdefault("sweep_processed", {tf: [] for tf in TIMEFRAMES})
             return state
     return {
         "processed": {tf: [] for tf in TIMEFRAMES},
         "raw_processed": {tf: [] for tf in TIMEFRAMES},
+        "sweep_processed": {tf: [] for tf in TIMEFRAMES},
     }
 
 
@@ -61,6 +83,8 @@ def save_state(state):
         state["processed"][tf] = state["processed"][tf][-MAX_PROCESSED_PER_TF:]
     for tf in state["raw_processed"]:
         state["raw_processed"][tf] = state["raw_processed"][tf][-MAX_PROCESSED_PER_TF:]
+    for tf in state["sweep_processed"]:
+        state["sweep_processed"][tf] = state["sweep_processed"][tf][-MAX_PROCESSED_PER_TF:]
     with open(STATE_FILE, "w") as f:
         json.dump(state, f, indent=2)
 
@@ -258,6 +282,95 @@ def evaluate_raw_impulses(tf_name, df_big, raw_processed_list):
     return raw_alerts, newly_processed
 
 
+# ---- Third alert type: opposite + sweep + shallow (0-30%) close ----
+# Uses a DIFFERENT impulse definition than the raw/confirmed alerts above,
+# matching exactly the validated backtest: body >= 50pts, body/range >= 60%,
+# and the wick on the impulse's OWN side <= 15 points (not a % of range).
+SWEEP_MIN_BODY_POINTS = 50.0
+SWEEP_MIN_BODY_TO_RANGE = 0.60
+SWEEP_MAX_WICK_POINTS = 15.0
+
+
+def is_sweep_impulse(row):
+    o, h, l, c = row["o"], row["h"], row["l"], row["c"]
+    body = abs(c - o)
+    rng = h - l
+    if rng <= 0 or body < SWEEP_MIN_BODY_POINTS:
+        return False, None
+    if (body / rng) < SWEEP_MIN_BODY_TO_RANGE:
+        return False, None
+
+    if c > o:
+        upper_wick = h - max(o, c)
+        if upper_wick > SWEEP_MAX_WICK_POINTS:
+            return False, None
+        return True, "green"
+    elif c < o:
+        lower_wick = min(o, c) - l
+        if lower_wick > SWEEP_MAX_WICK_POINTS:
+            return False, None
+        return True, "red"
+    return False, None
+
+
+def retracement_percent(impulse_open, impulse_close, price):
+    """0% = impulse close, 100% = impulse open."""
+    body = abs(impulse_close - impulse_open)
+    if body <= 0:
+        return 0.0
+    if impulse_close > impulse_open:
+        return ((impulse_close - price) / body) * 100.0
+    return ((price - impulse_close) / body) * 100.0
+
+
+def evaluate_sweep_setups(tf_name, df_big, sweep_processed_list):
+    """
+    Third, independent alert path: fires once the IMMEDIATE next same-TF
+    candle has closed and satisfies three conditions together:
+      1. Opposite color from the impulse
+      2. Sweeps beyond the impulse's own extreme before closing
+      3. Closes back in the shallow 0-30% retracement zone
+    Requires a full next-candle close (not just a partial lower-TF window),
+    so this is typically SLOWER to fire than the confirmed 🚨 alert, but
+    doesn't depend on lower-timeframe data at all.
+    """
+    sweep_alerts = []
+    newly_processed = []
+
+    for i in range(len(df_big) - 1):
+        row = df_big.iloc[i]
+        ts_str = row["t"].isoformat()
+        if ts_str in sweep_processed_list:
+            continue
+
+        is_impulse, color = is_sweep_impulse(row)
+        if not is_impulse:
+            continue
+
+        nxt = df_big.iloc[i + 1]  # guaranteed closed (includePartialBar=False)
+
+        opposite = (nxt["c"] < nxt["o"]) if color == "green" else (nxt["c"] > nxt["o"])
+        sweep = (nxt["h"] > row["h"]) if color == "green" else (nxt["l"] < row["l"])
+        next_close_retr = retracement_percent(row["o"], row["c"], nxt["c"])
+        close_0_30 = 0.0 <= next_close_retr <= 30.0
+
+        newly_processed.append(ts_str)
+
+        if opposite and sweep and close_0_30:
+            sweep_alerts.append({
+                "tf": tf_name,
+                "time": ts_str,
+                "color": color,
+                "body_points": round(abs(row["c"] - row["o"]), 2),
+                "open": row["o"],
+                "close": row["c"],
+                "next_close": nxt["c"],
+                "next_close_retracement_pct": round(next_close_retr, 1),
+            })
+
+    return sweep_alerts, newly_processed
+
+
 def main():
     state = load_state()
     session, headers = authenticate()
@@ -276,6 +389,7 @@ def main():
 
     all_alerts = []
     all_raw_alerts = []
+    all_sweep_alerts = []
 
     for tf_name, cfg in TIMEFRAMES.items():
         df_big = get_granularity(cfg["minutes"], cfg["unit"], cfg["unitNumber"], cfg["lookback_days"])
@@ -296,13 +410,19 @@ def main():
         raw_processed_list.extend(raw_newly_processed)
         all_raw_alerts.extend(raw_alerts)
 
+        sweep_processed_list = state["sweep_processed"].setdefault(tf_name, [])
+        sweep_alerts, sweep_newly_processed = evaluate_sweep_setups(tf_name, df_big, sweep_processed_list)
+        sweep_processed_list.extend(sweep_newly_processed)
+        all_sweep_alerts.extend(sweep_alerts)
+
     # Instant, unconfirmed alerts — fire first since they're the faster signal
     for alert in all_raw_alerts:
         direction = "possible SHORT setup forming" if alert["color"] == "green" else "possible LONG setup forming"
+        tf_minutes = TIMEFRAMES[alert["tf"]]["minutes"]
         msg = (
             f"⚡ RAW IMPULSE — {alert['tf']} timeframe (NOT confirmed yet)\n"
             f"Impulse candle: {alert['color'].upper()} ({alert['body_points']} pts)\n"
-            f"Time: {alert['time']}\n"
+            f"Candle closed: {candle_close_ist_str(alert['time'], tf_minutes)}\n"
             f"{direction}\n"
             f"Watch for target (candle open): {alert['open']}\n"
             f"Impulse close: {alert['close']}\n"
@@ -311,12 +431,15 @@ def main():
         print(msg)
         send_telegram(msg)
 
-    for alert in all_alerts:
+    for alert in all_sweep_alerts:
         direction = "SHORT (fade back down)" if alert["color"] == "green" else "LONG (fade back up)"
+        tf_minutes = TIMEFRAMES[alert["tf"]]["minutes"]
         msg = (
-            f"🚨 MNQ Setup — {alert['tf']} timeframe\n"
+            f"🎯 SWEEP + SHALLOW CLOSE — {alert['tf']} timeframe\n"
             f"Impulse candle: {alert['color'].upper()} ({alert['body_points']} pts)\n"
-            f"Time: {alert['time']}\n"
+            f"Candle closed: {candle_close_ist_str(alert['time'], tf_minutes)}\n"
+            f"Next candle swept the extreme, then closed back at only "
+            f"{alert['next_close_retracement_pct']}% retracement\n"
             f"Bias: {direction}\n"
             f"Target (candle open): {alert['open']}\n"
             f"Impulse close: {alert['close']}"
@@ -324,7 +447,21 @@ def main():
         print(msg)
         send_telegram(msg)
 
-    if not all_alerts and not all_raw_alerts:
+    for alert in all_alerts:
+        direction = "SHORT (fade back down)" if alert["color"] == "green" else "LONG (fade back up)"
+        tf_minutes = TIMEFRAMES[alert["tf"]]["minutes"]
+        msg = (
+            f"🚨 MNQ Setup — {alert['tf']} timeframe\n"
+            f"Impulse candle: {alert['color'].upper()} ({alert['body_points']} pts)\n"
+            f"Candle closed: {candle_close_ist_str(alert['time'], tf_minutes)}\n"
+            f"Bias: {direction}\n"
+            f"Target (candle open): {alert['open']}\n"
+            f"Impulse close: {alert['close']}"
+        )
+        print(msg)
+        send_telegram(msg)
+
+    if not all_alerts and not all_raw_alerts and not all_sweep_alerts:
         print("No new setups this run.")
 
     save_state(state)
