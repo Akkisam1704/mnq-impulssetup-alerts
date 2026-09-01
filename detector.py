@@ -40,7 +40,7 @@ BASE_URL = "https://api.topstepx.com"
 STATE_FILE = "state.json"
 
 MIN_BODY_POINTS = 50
-MAX_WICK_PCT = 0.25
+MAX_WICK_PCT = 0.30
 MAX_PROCESSED_PER_TF = 2000  # generous cap — state now only stores real candidates, not every candle
 
 # Timeframe -> API params + own duration in minutes
